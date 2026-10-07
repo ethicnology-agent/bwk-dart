@@ -2,6 +2,9 @@
 
 pub mod api;
 
+#[cfg(test)]
+mod test_support;
+
 #[cfg(not(feature = "bull_sdk"))]
 mod frb_generated;
 

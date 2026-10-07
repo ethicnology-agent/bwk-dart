@@ -8,15 +8,20 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 flutter_rust_bridge = "=2.12.0"
-bwk-sp  = { git = "https://github.com/pythcoiner/bwk", branch = "master", package = "bwk-sp" }
-bwk     = { git = "https://github.com/pythcoiner/bwk", branch = "master", package = "bwk", features = ["sp"] }
-bwk-tx  = { git = "https://github.com/pythcoiner/bwk", branch = "master", package = "bwk-tx" }
+# bwk PR #114 ("Signing rework"), frozen on our fork: accounts are keyless and
+# signing is done outside them.
+bwk-sp   = { git = "https://github.com/ethicnology-agent/bwk", rev = "a2af7a967dc478c9a32f28a19bc511c71b2ea36f", package = "bwk-sp", features = ["sqlite"] }
+bwk      = { git = "https://github.com/ethicnology-agent/bwk", rev = "a2af7a967dc478c9a32f28a19bc511c71b2ea36f", package = "bwk", features = ["sp"] }
+bwk-tx   = { git = "https://github.com/ethicnology-agent/bwk", rev = "a2af7a967dc478c9a32f28a19bc511c71b2ea36f", package = "bwk-tx" }
+bwk-psbt = { git = "https://github.com/ethicnology-agent/bwk", rev = "a2af7a967dc478c9a32f28a19bc511c71b2ea36f", package = "bwk-psbt" }
+bwk-coin = { git = "https://github.com/ethicnology-agent/bwk", rev = "a2af7a967dc478c9a32f28a19bc511c71b2ea36f", package = "bwk-coin" }
 bitcoin = { version = "0.32", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "2"
 log = "0.4"
 thiserror = "1"
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

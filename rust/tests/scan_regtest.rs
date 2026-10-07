@@ -1,12 +1,12 @@
 //! Regtest integration tests for scan_once() and stop_scan().
 //! Requires: SP_NETWORK_TESTS=1 and a live minta.pythcoiner.dev regtest instance.
 
+mod common;
+
 fn should_run() -> bool {
     std::env::var("SP_NETWORK_TESTS").as_deref() == Ok("1")
 }
 
-const TEST_MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const MINTA_BASE: &str = "http://minta.pythcoiner.dev";
 
 #[test]
@@ -21,17 +21,13 @@ fn scan_once_receives_payment() {
     assert!(defaults.is_ok, "minta unreachable: {}", defaults.error);
 
     let dir = tempfile::tempdir().unwrap();
-    let account = dart_bwk::api::sp_account::SpAccount::create_from_mnemonic(
-        "test-scan".to_string(),
-        dart_bwk::api::types::SpNetwork::Regtest,
-        TEST_MNEMONIC.to_string(),
+    let account = common::watch_only_account(
+        "test-scan",
+        dir.path(),
+        &common::derive(common::TEST_MNEMONIC),
         defaults.blindbit_url.clone(),
         defaults.electrum_url.clone(),
-        dir.path().to_str().unwrap().to_string(),
-        None,
-        None,
-    )
-    .expect("create account");
+    );
 
     let sp_address = account.sp_address().expect("sp_address");
     assert!(!sp_address.is_empty());
@@ -62,16 +58,13 @@ fn scan_once_receives_payment() {
         mine_resp.status()
     );
 
-    // OneShot scan is synchronous: scan_once() blocks until the scan completes.
+    // scan_once() starts the scan on a bwk_sp thread and returns.
     assert!(
         !account.is_scanning().expect("is_scanning"),
         "not scanning before scan_once"
     );
     account.scan_once(None).expect("scan_once failed");
-    assert!(
-        !account.is_scanning().expect("is_scanning"),
-        "not scanning after oneshot completes"
-    );
+    common::wait_for_scan(&account);
 
     assert!(
         account.confirmed_balance().expect("confirmed_balance") > 0,
@@ -98,47 +91,19 @@ fn stop_scan_no_panic() {
     assert!(defaults.is_ok, "minta unreachable: {}", defaults.error);
 
     let dir = tempfile::tempdir().unwrap();
-    let account = dart_bwk::api::sp_account::SpAccount::create_from_mnemonic(
-        "test-stop".to_string(),
-        dart_bwk::api::types::SpNetwork::Regtest,
-        TEST_MNEMONIC.to_string(),
+    let account = common::watch_only_account(
+        "test-stop",
+        dir.path(),
+        &common::derive(common::TEST_MNEMONIC),
         defaults.blindbit_url,
         defaults.electrum_url,
-        dir.path().to_str().unwrap().to_string(),
-        None,
-        None,
-    )
-    .expect("create account");
+    );
 
     // stop_scan() is a no-op when no scan is running; must not panic.
     // It's async (flips an atomic cancel flag without touching the
     // inner mutex), so block on the future to drive it to completion.
-    block_on(account.stop_scan()).expect("stop_scan");
+    common::block_on(account.stop_scan()).expect("stop_scan");
     assert!(!account.is_scanning().expect("is_scanning"));
-}
-
-/// Minimal noop-waker block_on for the few async helpers exercised by the
-/// regtest harness. We don't pull tokio into the test crate just for this.
-fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
-    use std::pin::Pin;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    fn noop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    let raw = RawWaker::new(std::ptr::null(), &VTABLE);
-    // SAFETY: vtable is all no-ops; data pointer never dereferenced.
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-    // SAFETY: fut owned by this function, not moved across polls.
-    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
-        }
-    }
 }
 
 #[test]
@@ -154,17 +119,13 @@ fn electrum_tx_push_no_scan_once() {
 
     let dir = tempfile::tempdir().unwrap();
 
-    let account = dart_bwk::api::sp_account::SpAccount::create_from_mnemonic(
-        "test-electrum-push".to_string(),
-        dart_bwk::api::types::SpNetwork::Regtest,
-        TEST_MNEMONIC.to_string(),
+    let account = common::watch_only_account(
+        "test-electrum-push",
+        dir.path(),
+        &common::derive(common::TEST_MNEMONIC),
         defaults.blindbit_url.clone(),
         defaults.electrum_url.clone(),
-        dir.path().to_str().unwrap().to_string(),
-        None,
-        None,
-    )
-    .expect("create account with sub-accounts");
+    );
 
     let recv_addr = account
         .new_taproot_address()
