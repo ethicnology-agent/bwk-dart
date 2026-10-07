@@ -232,6 +232,10 @@ pub enum SpError {
     /// another network, or carrying a key the account must not hold.
     /// `reason` never quotes the descriptor.
     InvalidDescriptor { reason: String },
+    /// The signer refused the PSBT or the keys it was lent: an input neither
+    /// key owns, an unsupported input, a PSBT already signed, a malformed key.
+    /// Nothing was signed. `reason` carries no key material.
+    Signing { reason: String },
     /// Anything else. `message` is for logs, never for the user.
     Other { message: String },
 }
@@ -259,6 +263,7 @@ impl std::fmt::Display for SpError {
                 "nothing left to send after the fee: {remainder_sat} sats is below the dust limit"
             ),
             Self::InvalidDescriptor { reason } => write!(f, "invalid descriptor: {reason}"),
+            Self::Signing { reason } => write!(f, "signing refused: {reason}"),
             Self::Other { message } => write!(f, "{message}"),
         }
     }

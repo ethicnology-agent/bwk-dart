@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 pub mod api;
+pub mod psbt_signer;
 
 #[cfg(test)]
 mod test_support;
