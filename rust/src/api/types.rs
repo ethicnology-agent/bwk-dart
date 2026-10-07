@@ -109,6 +109,17 @@ pub struct SpCoinView {
     pub label: Option<String>,
 }
 
+/// An output of a signed transaction that the account owns, as
+/// [`crate::api::sp_account::SpAccount::owned_outputs`] finds it.
+#[frb(unignore)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpOwnedOutput {
+    pub vout: u32,
+    pub amount_sat: u64,
+    /// Paid to the account's SP change label (`m = 0`).
+    pub is_change: bool,
+}
+
 /// Typed payment direction surfaced to Dart so consumers can `match` on
 /// it exhaustively instead of string-comparing.
 #[frb(unignore)]

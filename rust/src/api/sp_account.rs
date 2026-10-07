@@ -31,9 +31,9 @@ use bwk_sp::scan::{ScanRuntimeConfig, DEFAULT_FETCH_CONCURRENCY_FACTOR};
 
 use crate::api::types::{
     CoinSource, HeaderProgressPhase, OutputDestination, RecipientView, SimulatedOutput,
-    SpBalanceView, SpCoinView, SpError, SpNetwork, SpNotification, SpPaymentDirection,
-    SpPaymentStatus, SpPaymentView, SpRecipientAddressKind, SubAccountKind, TxSimulation,
-    UnifiedCoinStatus, UnifiedCoinView,
+    SpBalanceView, SpCoinView, SpError, SpNetwork, SpNotification, SpOwnedOutput,
+    SpPaymentDirection, SpPaymentStatus, SpPaymentView, SpRecipientAddressKind, SubAccountKind,
+    TxSimulation, UnifiedCoinStatus, UnifiedCoinView,
 };
 use crate::frb_generated::StreamSink;
 
@@ -1225,6 +1225,92 @@ impl SpAccount {
         Ok(bitcoin::consensus::encode::serialize(&tx))
     }
 
+    /// The outputs of a signed transaction (the raw bytes [finalize]
+    /// returns) that this account owns. They are found the way the scanner
+    /// finds payments, from the scan key, the transaction's input public keys
+    /// and the account's labels, independently of the code that built the
+    /// transaction. Call it before broadcast to check that the expected SP
+    /// change is there, reported with `is_change`.
+    ///
+    /// Every input must spend a coin of this account (SP or sub-account), to
+    /// know its prevout; otherwise the call fails.
+    pub fn owned_outputs(&self, tx_bytes: Vec<u8>) -> Result<Vec<SpOwnedOutput>, SpError> {
+        use bwk_sp::core::receiving::{
+            calculate_ecdh_shared_secret, calculate_tweak_data, eligible_input_pubkey, Label,
+        };
+        let other = |message: String| SpError::Other { message };
+
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&tx_bytes)
+            .map_err(|e| other(format!("invalid transaction bytes: {e}")))?;
+        let inner = lock_inner(&self.inner)?;
+        let prevouts = tx
+            .input
+            .iter()
+            .map(|input| own_prevout(&inner, &input.previous_output))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| other("transaction spends a coin this account does not hold".into()))?;
+
+        let mut input_keys = Vec::new();
+        for (input, prevout) in tx.input.iter().zip(&prevouts) {
+            if let Some(key) = eligible_input_pubkey(input, prevout)
+                .map_err(|e| other(format!("input key: {e}")))?
+            {
+                input_keys.push(key);
+            }
+        }
+        // No eligible input, no silent payment.
+        if input_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key_refs: Vec<_> = input_keys.iter().collect();
+        let outpoints: Vec<_> = tx.input.iter().map(|i| i.previous_output).collect();
+        let tweak_data = calculate_tweak_data(&key_refs, &outpoints)
+            .map_err(|e| other(format!("tweak data: {e}")))?;
+
+        let receiver = inner.sp_receiver();
+        let mut scan_sk = receiver.get_scan_key();
+        let shared = calculate_ecdh_shared_secret(&tweak_data, &scan_sk);
+        let change_label = Label::new(scan_sk, 0);
+        scan_sk.non_secure_erase();
+
+        let candidates: Vec<(u32, bitcoin::XOnlyPublicKey, u64)> = tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.script_pubkey.is_p2tr())
+            .filter_map(|(vout, o)| {
+                bitcoin::XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..34])
+                    .ok()
+                    .map(|key| (vout as u32, key, o.value.to_sat()))
+            })
+            .collect();
+        let keys: Vec<_> = candidates.iter().map(|(_, key, _)| *key).collect();
+        let found = receiver
+            .receiver
+            .scan_transaction(shared, &keys)
+            .map_err(|e| other(format!("scan: {e}")))?;
+
+        let mut owned: Vec<SpOwnedOutput> = found
+            .into_iter()
+            .flat_map(|(label, outputs)| {
+                let is_change = label.as_ref() == Some(&change_label);
+                outputs.into_keys().map(move |key| (key, is_change))
+            })
+            .filter_map(|(key, is_change)| {
+                candidates
+                    .iter()
+                    .find(|(_, candidate, _)| *candidate == key)
+                    .map(|(vout, _, amount_sat)| SpOwnedOutput {
+                        vout: *vout,
+                        amount_sat: *amount_sat,
+                        is_change,
+                    })
+            })
+            .collect();
+        owned.sort_by_key(|o| o.vout);
+        Ok(owned)
+    }
+
     /// Start broadcasting a signed transaction to the network via Electrum.
     /// tx_hex: hex-encoded raw transaction bytes.
     /// Completion is delivered as Broadcasted or BroadcastFailed notification.
@@ -1729,6 +1815,21 @@ fn pin_signed_to_unsigned(
         }
     }
     Ok(())
+}
+
+/// The prevout `outpoint` names, from the account's SP coins or its
+/// sub-accounts' coins.
+fn own_prevout(account: &SpAccountInner, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
+    if let Some(coin) = account.get_coin(outpoint) {
+        return Some(bitcoin::TxOut {
+            value: coin.amount(),
+            script_pubkey: coin.script().clone(),
+        });
+    }
+    account
+        .scanners()
+        .find_map(|sub| sub.get_coin(outpoint))
+        .map(|coin| coin.txout)
 }
 
 /// Whether `outpoint` is still an unspent coin of the account (SP or a
@@ -2960,6 +3061,61 @@ mod tests {
             .finalize(sim, signed)
             .expect_err("coin gone");
         assert!(matches!(err, SpError::SimulationDrifted { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn owned_outputs_finds_the_payment_to_self_and_the_change() {
+        let dir = tempdir().unwrap();
+        let acc = funded("owned-self", dir.path(), &[(9, 1, 500_000)]);
+        let own = acc.sp_address().unwrap();
+        let sim = acc.prepare_psbt(pay_sp(own, 100_000), 1).unwrap();
+        let raw = acc.finalize(sim.clone(), sign(&sim)).unwrap();
+
+        let owned = acc.owned_outputs(raw).expect("owned outputs");
+        assert_eq!(owned.len(), 2, "payment and change: {owned:?}");
+        assert!(owned
+            .iter()
+            .any(|o| !o.is_change && o.amount_sat == 100_000));
+        assert!(owned
+            .iter()
+            .any(|o| o.is_change && o.amount_sat == sim.change_sat));
+        for o in &owned {
+            assert_eq!(sim.tx_outputs[o.vout as usize].is_change, o.is_change);
+        }
+    }
+
+    #[test]
+    fn owned_outputs_finds_only_the_change_of_a_payment_out() {
+        let dir = tempdir().unwrap();
+        let acc = funded("owned-out", dir.path(), &[(9, 1, 500_000)]);
+        let sim = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 100_000), 1)
+            .unwrap();
+        let raw = acc.finalize(sim.clone(), sign(&sim)).unwrap();
+        let owned = acc.owned_outputs(raw).unwrap();
+        assert_eq!(owned.len(), 1, "{owned:?}");
+        assert!(owned[0].is_change);
+        assert_eq!(owned[0].amount_sat, sim.change_sat);
+    }
+
+    #[test]
+    fn owned_outputs_refuses_a_transaction_spending_foreign_coins() {
+        let dir = tempdir().unwrap();
+        let acc = watch_only("owned-foreign", dir.path());
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![],
+        };
+        let err = acc
+            .owned_outputs(bitcoin::consensus::encode::serialize(&tx))
+            .expect_err("unknown input");
+        assert!(
+            matches!(&err, SpError::Other { message } if message.contains("does not hold")),
+            "got: {err:?}"
+        );
+        assert!(acc.owned_outputs(vec![0xff]).is_err());
     }
 
     /// Minimal hand-rolled block_on for the async dispose/stop_scan
