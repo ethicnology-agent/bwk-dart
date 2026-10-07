@@ -30,9 +30,10 @@ use bwk_sp::receiver::RecipientAddress;
 use bwk_sp::scan::{ScanRuntimeConfig, DEFAULT_FETCH_CONCURRENCY_FACTOR};
 
 use crate::api::types::{
-    CoinSource, HeaderProgressPhase, RecipientView, SpBalanceView, SpCoinView, SpError, SpNetwork,
-    SpNotification, SpPaymentDirection, SpPaymentStatus, SpPaymentView, SpRecipientAddressKind,
-    SubAccountKind, TxSimulation, UnifiedCoinStatus, UnifiedCoinView,
+    CoinSource, HeaderProgressPhase, OutputDestination, RecipientView, SimulatedOutput,
+    SpBalanceView, SpCoinView, SpError, SpNetwork, SpNotification, SpPaymentDirection,
+    SpPaymentStatus, SpPaymentView, SpRecipientAddressKind, SubAccountKind, TxSimulation,
+    UnifiedCoinStatus, UnifiedCoinView,
 };
 use crate::frb_generated::StreamSink;
 
@@ -1063,7 +1064,13 @@ impl SpAccount {
         Ok(())
     }
 
-    /// Preview a transaction: run coin selection and return fee/change estimates.
+    /// Build the transaction to confirm: run coin selection, build the
+    /// unsigned PSBTv2 with the selected coins pinned, and describe it.
+    ///
+    /// The returned [`TxSimulation`] carries the PSBT to sign
+    /// ([`crate::api::sp_signer::sign_silent_payment_psbt`]) and what it
+    /// spends and pays, read from that PSBT. Silent-payment outputs are left
+    /// unscripted: the signer derives them, and `finalize` verifies them.
     ///
     /// feerate_sat_vb: fee rate in satoshis per virtual byte.
     pub fn prepare_psbt(
@@ -1078,7 +1085,7 @@ impl SpAccount {
                 return Err(SpError::NothingToSendAfterFee { remainder_sat });
             }
         }
-        let builder = build_tx_with_coin_selection(&inner, &outputs, has_max, feerate_sat_vb);
+        let mut builder = build_tx_with_coin_selection(&inner, &outputs, has_max, feerate_sat_vb);
         let result = guard_builder(|| builder.simulate())?;
 
         if let Some(err) = result.error {
@@ -1090,84 +1097,132 @@ impl SpAccount {
             }
         }
 
-        let inputs: Vec<UnifiedCoinView> = result
-            .tx_template
+        // Pin the coins the simulation selected, so building the PSBT does
+        // not select again.
+        let selected = result.tx_template.inputs;
+        for coin in &selected {
+            builder.add_input(coin.clone());
+        }
+        let psbt = guard_builder(|| builder.generate_v2())?.map_err(|e| SpError::Other {
+            message: format!("PSBT generation failed: {e:?}"),
+        })?;
+        let described = describe_psbt(&inner, &psbt)?;
+        let outputs = resolve_recipients(&inner, recipients, &described.tx_outputs)?;
+        let bytes = psbt.serialize().map_err(|e| SpError::Other {
+            message: format!("PSBT serialization failed: {e:?}"),
+        })?;
+
+        let inputs = described
             .inputs
-            .iter()
-            .map(|coin| UnifiedCoinView {
-                source: match coin.source() {
-                    bwk_coin::CoinSourceKind::SilentPayment => CoinSource::Sp,
-                    bwk_coin::CoinSourceKind::Segwit => CoinSource::Segwit,
-                    bwk_coin::CoinSourceKind::Taproot => CoinSource::Taproot,
-                    bwk_coin::CoinSourceKind::Other => CoinSource::Other,
-                },
-                outpoint: coin.outpoint.to_string(),
-                amount_sat: coin.txout.value.to_sat(),
-                height: coin.height.map(|h| h as u32),
-                // Selected tx inputs are unspent UTXOs being spent.
-                status: UnifiedCoinStatus::Unspent,
-            })
-            .collect();
-
-        let fee_sat = result.fees.map(|f| f.to_sat()).unwrap_or(0);
-        let change_sat = result.change.map(|c| c.to_sat()).unwrap_or(0);
-
-        // For a max output bwk drained all inputs; report the computed amount
-        // (total inputs - fee - the fixed outputs) so the Confirm page shows it.
-        let input_total: u64 = inputs.iter().map(|i| i.amount_sat).sum();
-        let non_max_total: u64 = recipients
-            .iter()
-            .map(|r| match r {
-                RecipientView::Sp {
-                    amount_sat, is_max, ..
-                }
-                | RecipientView::Standard {
-                    amount_sat, is_max, ..
-                } => {
-                    if *is_max {
-                        0
-                    } else {
-                        *amount_sat
-                    }
-                }
-            })
-            .sum();
-        let max_amount = input_total
-            .saturating_sub(fee_sat)
-            .saturating_sub(non_max_total);
-
-        let outputs: Vec<RecipientView> = recipients
             .into_iter()
-            .map(|r| match r {
-                RecipientView::Sp {
-                    address,
+            .map(|(outpoint, amount_sat)| {
+                let coin = selected.iter().find(|c| c.outpoint == outpoint);
+                UnifiedCoinView {
+                    source: match coin.map(|c| c.source()) {
+                        Some(bwk_coin::CoinSourceKind::SilentPayment) => CoinSource::Sp,
+                        Some(bwk_coin::CoinSourceKind::Segwit) => CoinSource::Segwit,
+                        Some(bwk_coin::CoinSourceKind::Taproot) => CoinSource::Taproot,
+                        Some(bwk_coin::CoinSourceKind::Other) | None => CoinSource::Other,
+                    },
+                    outpoint: outpoint.to_string(),
                     amount_sat,
-                    label,
-                    is_max,
-                } => RecipientView::Sp {
-                    address,
-                    amount_sat: if is_max { max_amount } else { amount_sat },
-                    label,
-                    is_max,
-                },
-                RecipientView::Standard {
-                    address,
-                    amount_sat,
-                    is_max,
-                } => RecipientView::Standard {
-                    address,
-                    amount_sat: if is_max { max_amount } else { amount_sat },
-                    is_max,
-                },
+                    height: coin.and_then(|c| c.height).map(|h| h as u32),
+                    // Selected tx inputs are unspent UTXOs being spent.
+                    status: UnifiedCoinStatus::Unspent,
+                }
             })
             .collect();
 
         Ok(TxSimulation {
             inputs,
             outputs,
-            fee_sat,
-            change_sat,
+            change_sat: described
+                .tx_outputs
+                .iter()
+                .filter(|o| o.is_change)
+                .map(|o| o.amount_sat)
+                .sum(),
+            tx_outputs: described.tx_outputs,
+            fee_sat: described.fee_sat,
+            fee_rate_sat_vb: feerate_sat_vb,
+            psbt: bytes,
         })
+    }
+
+    /// Verify a signed PSBT against the simulation the user confirmed and
+    /// extract the transaction. Returns the raw serialized transaction;
+    /// hex-encode it for [broadcast].
+    ///
+    /// Refused, with nothing extracted, when:
+    /// - `simulation` no longer describes its own unsigned PSBT, or
+    ///   `signed_psbt` spends other inputs, pays other outputs (amount,
+    ///   script, silent-payment recipient keys) or pays another fee:
+    ///   [`SpError::SignedPsbtMismatch`];
+    /// - a spent coin is no longer in the wallet or no longer spendable:
+    ///   [`SpError::SimulationDrifted`];
+    /// - the account's BIP375 verification (shares, DLEQ proofs, every
+    ///   silent-payment output script) or the signatures fail:
+    ///   [`SpError::Verification`].
+    pub fn finalize(
+        &self,
+        simulation: TxSimulation,
+        signed_psbt: Vec<u8>,
+    ) -> Result<Vec<u8>, SpError> {
+        let inner = lock_inner(&self.inner)?;
+        let mismatch = |detail: &str| SpError::SignedPsbtMismatch {
+            detail: detail.to_string(),
+        };
+
+        let unsigned = bwk_psbt::PsbtV2::deserialize(&simulation.psbt)
+            .map_err(|_| mismatch("the simulation carries no valid PSBTv2"))?;
+        let described = describe_psbt(&inner, &unsigned)?;
+        let simulated_inputs: Vec<(String, u64)> = simulation
+            .inputs
+            .iter()
+            .map(|i| (i.outpoint.clone(), i.amount_sat))
+            .collect();
+        let described_inputs: Vec<(String, u64)> = described
+            .inputs
+            .iter()
+            .map(|(outpoint, amount)| (outpoint.to_string(), *amount))
+            .collect();
+        if simulated_inputs != described_inputs
+            || simulation.tx_outputs != described.tx_outputs
+            || simulation.fee_sat != described.fee_sat
+        {
+            return Err(mismatch("the simulation does not describe its PSBT"));
+        }
+
+        let signed = bwk_psbt::PsbtV2::deserialize(&signed_psbt)
+            .map_err(|_| mismatch("the signed PSBT is not a valid PSBTv2"))?;
+        pin_signed_to_unsigned(&unsigned, &signed).map_err(mismatch)?;
+
+        for input in &unsigned.inputs {
+            if !coin_is_spendable(&inner, &input.previous_output) {
+                return Err(SpError::SimulationDrifted {
+                    detail: format!(
+                        "coin {} is no longer in the wallet or no longer spendable",
+                        input.previous_output
+                    ),
+                });
+            }
+        }
+
+        let tx = inner.finalize(&signed_psbt).map_err(|e| match e {
+            sp_account::AccountError::Finalize(_) => SpError::Verification {
+                reason: "the signatures do not finalize".to_string(),
+            },
+            sp_account::AccountError::Bip375(reason) => SpError::Verification { reason },
+            sp_account::AccountError::PsbtV2 | sp_account::AccountError::PsbtDecode => {
+                SpError::Verification {
+                    reason: e.to_string(),
+                }
+            }
+            other => SpError::Other {
+                message: other.to_string(),
+            },
+        })?;
+        Ok(bitcoin::consensus::encode::serialize(&tx))
     }
 
     /// Start broadcasting a signed transaction to the network via Electrum.
@@ -1409,6 +1464,287 @@ fn map_sp_notification(
             None
         }
     }
+}
+
+/// What an unsigned PSBTv2 spends and pays, as the simulation shows it.
+struct DescribedPsbt {
+    /// `(outpoint, amount)` per input, in transaction order.
+    inputs: Vec<(bitcoin::OutPoint, u64)>,
+    tx_outputs: Vec<SimulatedOutput>,
+    fee_sat: u64,
+}
+
+fn describe_psbt(
+    inner: &SpAccountInner,
+    psbt: &bwk_psbt::PsbtV2,
+) -> Result<DescribedPsbt, SpError> {
+    let other = |message: &str| SpError::Other {
+        message: message.to_string(),
+    };
+    let network = inner.network();
+    let sp_network = bwk_sp::account::recipient::to_sp_network(network);
+    let change = inner.sp_receiver().receiver.get_change_address();
+
+    let mut inputs = Vec::with_capacity(psbt.inputs.len());
+    for input in &psbt.inputs {
+        let prevout = input
+            .psbt
+            .witness_utxo
+            .as_ref()
+            .ok_or_else(|| other("a PSBT input has no witness_utxo"))?;
+        inputs.push((input.previous_output, prevout.value.to_sat()));
+    }
+
+    let mut tx_outputs = Vec::with_capacity(psbt.outputs.len());
+    for (vout, output) in psbt.outputs.iter().enumerate() {
+        let sp = bwk_psbt::sp::sp_v0_output(&output.psbt)
+            .map_err(|_| other("a PSBT output carries malformed silent-payment fields"))?;
+        let (destination, is_change) = match (sp, &output.script_pubkey) {
+            (Some(info), _) => {
+                let address = bwk_sp::core::utils::common::SilentPaymentAddress::new(
+                    info.scan_key,
+                    info.spend_key,
+                    sp_network,
+                    bwk_sp::core::SpVersion::V0,
+                )
+                .map_err(|_| other("a silent-payment output has invalid keys"))?;
+                let is_change = info.scan_key == change.get_scan_key()
+                    && info.spend_key == change.get_spend_key();
+                (
+                    OutputDestination::SilentPayment {
+                        address: address.to_string(),
+                        scan_key: info.scan_key.to_string(),
+                        spend_key: info.spend_key.to_string(),
+                        label: info.label,
+                    },
+                    is_change,
+                )
+            }
+            (None, Some(script)) => (
+                match bitcoin::Address::from_script(script, network) {
+                    Ok(address) => OutputDestination::Address {
+                        address: address.to_string(),
+                    },
+                    Err(_) => OutputDestination::Script {
+                        script_hex: script.to_hex_string(),
+                    },
+                },
+                false,
+            ),
+            (None, None) => return Err(other("a PSBT output has neither script nor SP fields")),
+        };
+        tx_outputs.push(SimulatedOutput {
+            vout: vout as u32,
+            amount_sat: output.amount.to_sat(),
+            destination,
+            is_change,
+        });
+    }
+
+    let input_total: u64 = inputs.iter().map(|(_, amount)| amount).sum();
+    let output_total: u64 = tx_outputs.iter().map(|o| o.amount_sat).sum();
+    let fee_sat = input_total
+        .checked_sub(output_total)
+        .ok_or_else(|| other("the PSBT pays more than it spends"))?;
+    Ok(DescribedPsbt {
+        inputs,
+        tx_outputs,
+        fee_sat,
+    })
+}
+
+/// The requested recipients with what the transaction actually pays each,
+/// matched to its non-change outputs. A recipient with no matching output, or
+/// paid another amount than requested, is a builder bug, refused here rather
+/// than shown to the user.
+fn resolve_recipients(
+    inner: &SpAccountInner,
+    recipients: Vec<RecipientView>,
+    tx_outputs: &[SimulatedOutput],
+) -> Result<Vec<RecipientView>, SpError> {
+    let network = inner.network();
+    let mut taken = vec![false; tx_outputs.len()];
+    let mut resolved = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        let (address, requested, is_max) = match &recipient {
+            RecipientView::Sp {
+                address,
+                amount_sat,
+                is_max,
+                ..
+            }
+            | RecipientView::Standard {
+                address,
+                amount_sat,
+                is_max,
+            } => (address.clone(), *amount_sat, *is_max),
+        };
+        let wanted = recipient_destination(&address, network)?;
+        let index = tx_outputs
+            .iter()
+            .enumerate()
+            .position(|(i, o)| {
+                !taken[i] && !o.is_change && same_destination(&o.destination, &wanted)
+            })
+            .ok_or_else(|| SpError::Other {
+                message: format!("the transaction has no output paying '{address}'"),
+            })?;
+        taken[index] = true;
+        let paid = tx_outputs[index].amount_sat;
+        if !is_max && paid != requested {
+            return Err(SpError::Other {
+                message: format!("'{address}' is paid {paid} sats instead of {requested}"),
+            });
+        }
+        resolved.push(match recipient {
+            RecipientView::Sp {
+                address,
+                label,
+                is_max,
+                ..
+            } => RecipientView::Sp {
+                address,
+                amount_sat: paid,
+                label,
+                is_max,
+            },
+            RecipientView::Standard {
+                address, is_max, ..
+            } => RecipientView::Standard {
+                address,
+                amount_sat: paid,
+                is_max,
+            },
+        });
+    }
+    Ok(resolved)
+}
+
+/// What a recipient address string pays to: SP keys, or a script.
+enum WantedDestination {
+    Sp {
+        scan_key: bitcoin::secp256k1::PublicKey,
+        spend_key: bitcoin::secp256k1::PublicKey,
+    },
+    Script(bitcoin::ScriptBuf),
+}
+
+fn recipient_destination(address: &str, network: Network) -> Result<WantedDestination, SpError> {
+    if let Ok(sp) = bwk_sp::core::utils::common::SilentPaymentAddress::try_from(address) {
+        return Ok(WantedDestination::Sp {
+            scan_key: sp.get_scan_key(),
+            spend_key: sp.get_spend_key(),
+        });
+    }
+    let address = bitcoin::Address::from_str(address)
+        .map_err(|e| format!("invalid address '{address}': {e}"))?
+        .require_network(network)
+        .map_err(|e| format!("wrong network for '{address}': {e}"))?;
+    Ok(WantedDestination::Script(address.script_pubkey()))
+}
+
+fn same_destination(output: &OutputDestination, wanted: &WantedDestination) -> bool {
+    match (output, wanted) {
+        (
+            OutputDestination::SilentPayment {
+                scan_key,
+                spend_key,
+                ..
+            },
+            WantedDestination::Sp {
+                scan_key: want_scan,
+                spend_key: want_spend,
+            },
+        ) => *scan_key == want_scan.to_string() && *spend_key == want_spend.to_string(),
+        (OutputDestination::Address { address }, WantedDestination::Script(script)) => {
+            bitcoin::Address::from_str(address)
+                .map(|a| a.assume_checked().script_pubkey() == *script)
+                .unwrap_or(false)
+        }
+        (OutputDestination::Script { script_hex }, WantedDestination::Script(script)) => {
+            *script_hex == script.to_hex_string()
+        }
+        _ => false,
+    }
+}
+
+/// Refuse a signed PSBT whose transaction is not the unsigned one's: same
+/// version and lock time, same inputs (outpoint, sequence, prevout), same
+/// outputs (amount, silent-payment recipient keys, script where the unsigned
+/// one had one). Silent-payment output scripts appear only once signed; that
+/// they derive from the recipient keys is what the BIP375 verification in
+/// `finalize` checks.
+fn pin_signed_to_unsigned(
+    unsigned: &bwk_psbt::PsbtV2,
+    signed: &bwk_psbt::PsbtV2,
+) -> Result<(), &'static str> {
+    if unsigned.tx_version != signed.tx_version
+        || unsigned.fallback_lock_time != signed.fallback_lock_time
+    {
+        return Err("version or lock time changed");
+    }
+    if unsigned.inputs.len() != signed.inputs.len() {
+        return Err("the inputs changed");
+    }
+    for (u, s) in unsigned.inputs.iter().zip(&signed.inputs) {
+        if u.previous_output != s.previous_output
+            || u.sequence != s.sequence
+            || u.required_time_lock_time != s.required_time_lock_time
+            || u.required_height_lock_time != s.required_height_lock_time
+            || u.psbt.witness_utxo != s.psbt.witness_utxo
+        {
+            return Err("the inputs changed");
+        }
+    }
+    if unsigned.outputs.len() != signed.outputs.len() {
+        return Err("the outputs changed");
+    }
+    for (u, s) in unsigned.outputs.iter().zip(&signed.outputs) {
+        if u.amount != s.amount {
+            return Err("an output amount changed");
+        }
+        let u_sp = bwk_psbt::sp::sp_v0_output(&u.psbt).map_err(|_| "malformed SP output")?;
+        let s_sp = bwk_psbt::sp::sp_v0_output(&s.psbt).map_err(|_| "malformed SP output")?;
+        match (u_sp, s_sp) {
+            (Some(u_sp), Some(s_sp)) => {
+                if u_sp.scan_key != s_sp.scan_key
+                    || u_sp.spend_key != s_sp.spend_key
+                    || u_sp.label != s_sp.label
+                {
+                    return Err("a silent-payment recipient changed");
+                }
+                if u.script_pubkey.is_some() && u.script_pubkey != s.script_pubkey {
+                    return Err("an output script changed");
+                }
+                if s.script_pubkey.is_none() {
+                    return Err("a silent-payment output was left unscripted");
+                }
+            }
+            (None, None) => {
+                if u.script_pubkey != s.script_pubkey {
+                    return Err("an output script changed");
+                }
+            }
+            _ => return Err("an output changed kind"),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `outpoint` is still an unspent coin of the account (SP or a
+/// sub-account).
+fn coin_is_spendable(inner: &SpAccountInner, outpoint: &bitcoin::OutPoint) -> bool {
+    if let Some(entry) = inner.get_coin(outpoint) {
+        return entry.is_spendable();
+    }
+    inner.scanners().any(|scanner| {
+        scanner.coins().get(outpoint).is_some_and(|entry| {
+            !matches!(
+                entry.status(),
+                bwk_coin::CoinStatus::Spent | bwk_coin::CoinStatus::BeingSpend
+            )
+        })
+    })
 }
 
 /// The sats a max send leaves after the fee, when that is too little to make
@@ -2345,6 +2681,285 @@ mod tests {
             panicked.is_err(),
             "bwk-tx no longer panics on a sub-dust max"
         );
+    }
+
+    // Offline send flow: prepare, sign with the lent keys, finalize. Nothing
+    // is broadcast.
+
+    fn recipient_sp_address() -> String {
+        let other = derive(keys::OTHER_MNEMONIC);
+        let secp = Secp256k1::new();
+        bwk_sp::core::utils::common::SilentPaymentAddress::new(
+            other.scan_sk.public_key(&secp),
+            other.spend_pk,
+            bwk_sp::core::utils::common::Network::Regtest,
+            bwk_sp::core::SpVersion::V0,
+        )
+        .unwrap()
+        .to_string()
+    }
+
+    fn pay_sp(address: String, amount_sat: u64) -> Vec<RecipientView> {
+        vec![RecipientView::Sp {
+            address,
+            amount_sat,
+            label: None,
+            is_max: false,
+        }]
+    }
+
+    fn sign(simulation: &TxSimulation) -> Vec<u8> {
+        let keys = derive(MNEMONIC);
+        crate::api::sp_signer::sign_silent_payment_psbt(
+            simulation.psbt.clone(),
+            keys.b_spend.secret_bytes().to_vec(),
+            Some(keys.taproot_account_xprv.to_string()),
+        )
+        .expect("sign")
+    }
+
+    #[test]
+    fn prepare_sign_finalize_offline() {
+        let dir = tempdir().unwrap();
+        let acc = funded("e2e", dir.path(), &[(9, 1, 500_000)]);
+        assert_eq!(acc.confirmed_balance().unwrap(), 500_000);
+        let to = recipient_sp_address();
+
+        let sim = acc
+            .prepare_psbt(pay_sp(to.clone(), 100_000), 2)
+            .expect("prepare");
+
+        // What the user confirms, read from the unsigned PSBT it carries.
+        assert_eq!(sim.inputs.len(), 1);
+        assert_eq!(sim.inputs[0].outpoint, outpoint(1).to_string());
+        assert!(matches!(sim.inputs[0].source, CoinSource::Sp));
+        assert_eq!(sim.tx_outputs.len(), 2, "recipient + SP change");
+        let paid: Vec<_> = sim.tx_outputs.iter().filter(|o| !o.is_change).collect();
+        assert_eq!(paid.len(), 1);
+        assert_eq!(paid[0].amount_sat, 100_000);
+        assert!(
+            matches!(&paid[0].destination, OutputDestination::SilentPayment { address, .. } if *address == to)
+        );
+        let change: Vec<_> = sim.tx_outputs.iter().filter(|o| o.is_change).collect();
+        assert_eq!(change.len(), 1);
+        assert_eq!(sim.change_sat, change[0].amount_sat);
+        assert!(sim.fee_sat > 0);
+        assert_eq!(sim.fee_sat + sim.change_sat + 100_000, 500_000);
+        assert_eq!(sim.fee_rate_sat_vb, 2);
+        assert!(matches!(
+            &sim.outputs[..],
+            [RecipientView::Sp {
+                amount_sat: 100_000,
+                ..
+            }]
+        ));
+        let unsigned = bwk_psbt::PsbtV2::deserialize(&sim.psbt).expect("an unsigned PSBTv2");
+        assert!(
+            unsigned.outputs.iter().all(|o| o.script_pubkey.is_none()),
+            "SP outputs are left for the signer to script"
+        );
+
+        let signed = sign(&sim);
+        let raw = acc.finalize(sim.clone(), signed).expect("finalize");
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&raw).unwrap();
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.input[0].previous_output, outpoint(1));
+        assert!(!tx.input[0].witness.is_empty());
+        assert_eq!(tx.output.len(), 2);
+        assert!(tx.output.iter().all(|o| o.script_pubkey.is_p2tr()));
+        for (out, simulated) in tx.output.iter().zip(&sim.tx_outputs) {
+            assert_eq!(out.value.to_sat(), simulated.amount_sat);
+        }
+
+        // Spending left no key on disk either.
+        drop(acc);
+        let keys = derive(MNEMONIC);
+        let hits = keys::find_secrets(dir.path(), &keys::secret_needles(&keys, MNEMONIC));
+        assert!(hits.is_empty(), "key material on disk: {hits:?}");
+    }
+
+    #[test]
+    fn max_send_pays_everything_but_the_fee() {
+        let dir = tempdir().unwrap();
+        let acc = funded("e2e-max", dir.path(), &[(9, 1, 300_000), (8, 2, 200_000)]);
+        let sim = acc
+            .prepare_psbt(
+                vec![RecipientView::Standard {
+                    address: test_bitcoin_address(Network::Regtest),
+                    amount_sat: 0,
+                    is_max: true,
+                }],
+                1,
+            )
+            .expect("prepare");
+        assert_eq!(sim.inputs.len(), 2);
+        assert_eq!(sim.tx_outputs.len(), 1);
+        assert!(!sim.tx_outputs[0].is_change);
+        assert_eq!(sim.change_sat, 0);
+        let [RecipientView::Standard { amount_sat, .. }] = &sim.outputs[..] else {
+            panic!("{:?}", sim.outputs);
+        };
+        assert_eq!(*amount_sat + sim.fee_sat, 500_000);
+        let signed = sign(&sim);
+        acc.finalize(sim, signed).expect("finalize");
+    }
+
+    #[test]
+    fn more_coins_than_selection_searches_is_too_many_coins() {
+        let dir = tempdir().unwrap();
+        let coins: Vec<(u8, u8, u64)> = (1..=21).map(|i| (i, i, 10_000)).collect();
+        let acc = funded("e2e-many", dir.path(), &coins);
+        let err = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 50_000), 1)
+            .expect_err("selection gives up");
+        assert!(
+            matches!(err, SpError::TooManyCoins { count: 21, max: 20 }),
+            "{err:?}"
+        );
+    }
+
+    /// The core redirect attack: an SP output script swapped after signing.
+    /// The pin cannot see it (the unsigned PSBT has no script there); the
+    /// account's BIP375 verification does.
+    #[test]
+    fn finalize_refuses_a_redirected_sp_output() {
+        let dir = tempdir().unwrap();
+        let acc = funded("e2e-redirect", dir.path(), &[(9, 1, 500_000)]);
+        let sim = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 100_000), 1)
+            .unwrap();
+        let mut tampered = bwk_psbt::PsbtV2::deserialize(&sign(&sim)).unwrap();
+        let secp = Secp256k1::new();
+        let (attacker, _) = SecretKey::from_slice(&[0x42; 32])
+            .unwrap()
+            .x_only_public_key(&secp);
+        let index = sim.tx_outputs.iter().position(|o| !o.is_change).unwrap();
+        tampered.outputs[index].script_pubkey = Some(bitcoin::ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(attacker),
+        ));
+        let err = acc
+            .finalize(sim, tampered.serialize().unwrap())
+            .expect_err("redirected output");
+        assert!(matches!(err, SpError::Verification { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn finalize_refuses_a_signed_psbt_paying_other_amounts_or_keys() {
+        let dir = tempdir().unwrap();
+        let acc = funded("e2e-amount", dir.path(), &[(9, 1, 500_000)]);
+        let sim = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 100_000), 1)
+            .unwrap();
+        let signed = sign(&sim);
+        let paid = sim.tx_outputs.iter().position(|o| !o.is_change).unwrap();
+
+        // A bigger fee: an output pays less.
+        let mut tampered = bwk_psbt::PsbtV2::deserialize(&signed).unwrap();
+        tampered.outputs[paid].amount =
+            tampered.outputs[paid].amount - bitcoin::Amount::from_sat(1_000);
+        let err = acc
+            .finalize(sim.clone(), tampered.serialize().unwrap())
+            .expect_err("amount changed");
+        assert!(matches!(err, SpError::SignedPsbtMismatch { .. }), "{err:?}");
+
+        // Another silent-payment recipient.
+        let mut tampered = bwk_psbt::PsbtV2::deserialize(&signed).unwrap();
+        let info = bwk_psbt::sp::sp_v0_output(&tampered.outputs[paid].psbt)
+            .unwrap()
+            .unwrap();
+        let other = SecretKey::from_slice(&[0x43; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new());
+        bwk_psbt::sp::set_sp_v0_output(
+            &mut tampered.outputs[paid].psbt,
+            info.scan_key,
+            other,
+            None,
+        );
+        let err = acc
+            .finalize(sim.clone(), tampered.serialize().unwrap())
+            .expect_err("recipient changed");
+        assert!(matches!(err, SpError::SignedPsbtMismatch { .. }), "{err:?}");
+
+        // Not a PSBT at all.
+        let err = acc
+            .finalize(sim.clone(), b"garbage".to_vec())
+            .expect_err("garbage");
+        assert!(matches!(err, SpError::SignedPsbtMismatch { .. }), "{err:?}");
+
+        // The untampered one still goes through.
+        acc.finalize(sim, signed).expect("finalize");
+    }
+
+    /// A signed PSBT is only accepted with the simulation it was built
+    /// from: signing another confirmed transaction does not substitute.
+    #[test]
+    fn finalize_refuses_the_signature_of_another_simulation() {
+        let dir = tempdir().unwrap();
+        let acc = funded("e2e-swap", dir.path(), &[(9, 1, 500_000)]);
+        let confirmed = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 100_000), 1)
+            .unwrap();
+        let other = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 150_000), 1)
+            .unwrap();
+        let err = acc
+            .finalize(confirmed, sign(&other))
+            .expect_err("signed another transaction");
+        assert!(matches!(err, SpError::SignedPsbtMismatch { .. }), "{err:?}");
+    }
+
+    /// The display fields travel back from Dart: a simulation edited to show
+    /// another fee, recipient or input than its PSBT does is refused.
+    #[test]
+    fn finalize_refuses_a_simulation_that_no_longer_describes_its_psbt() {
+        let dir = tempdir().unwrap();
+        let acc = funded("e2e-edited", dir.path(), &[(9, 1, 500_000)]);
+        let sim = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 100_000), 1)
+            .unwrap();
+        let signed = sign(&sim);
+        let mut fee = sim.clone();
+        fee.fee_sat -= 1;
+        let mut output = sim.clone();
+        output.tx_outputs[0].amount_sat += 1;
+        let mut input = sim.clone();
+        input.inputs[0].outpoint = outpoint(2).to_string();
+        let mut psbt = sim.clone();
+        psbt.psbt = b"garbage".to_vec();
+        for (case, edited) in [
+            ("fee", fee),
+            ("output", output),
+            ("input", input),
+            ("psbt", psbt),
+        ] {
+            let err = acc
+                .finalize(edited, signed.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{case}: refused"));
+            assert!(
+                matches!(err, SpError::SignedPsbtMismatch { .. }),
+                "{case}: {err:?}"
+            );
+        }
+    }
+
+    /// A coin that left the wallet between confirmation and finalize: the
+    /// same PSBT, finalized by an account that no longer holds the coin.
+    #[test]
+    fn finalize_refuses_a_drifted_simulation() {
+        let dir = tempdir().unwrap();
+        let acc = funded("e2e-drift", dir.path(), &[(9, 1, 500_000)]);
+        let sim = acc
+            .prepare_psbt(pay_sp(recipient_sp_address(), 100_000), 1)
+            .unwrap();
+        let signed = sign(&sim);
+        let empty_dir = tempdir().unwrap();
+        let without_the_coin = watch_only("e2e-drift", empty_dir.path());
+        let err = without_the_coin
+            .finalize(sim, signed)
+            .expect_err("coin gone");
+        assert!(matches!(err, SpError::SimulationDrifted { .. }), "{err:?}");
     }
 
     /// Minimal hand-rolled block_on for the async dispose/stop_scan

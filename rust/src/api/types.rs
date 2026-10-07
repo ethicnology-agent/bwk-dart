@@ -176,13 +176,59 @@ pub enum SpRecipientAddressKind {
     Standard,
 }
 
+/// Where one output of a simulated transaction pays.
+#[frb(unignore)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputDestination {
+    /// A silent-payment output. Its script is derived by the signer, so the
+    /// unsigned PSBT carries the recipient's keys instead: `address` is the SP
+    /// address those keys (and `label`) form, `scan_key`/`spend_key` the
+    /// 33-byte compressed public keys, in hex.
+    SilentPayment {
+        address: String,
+        scan_key: String,
+        spend_key: String,
+        label: Option<u32>,
+    },
+    /// A standard output to a known address.
+    Address { address: String },
+    /// A script with no address form, in hex.
+    Script { script_hex: String },
+}
+
+/// One output of a simulated transaction, in transaction order.
+#[frb(unignore)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulatedOutput {
+    pub vout: u32,
+    pub amount_sat: u64,
+    pub destination: OutputDestination,
+    /// Pays the account's own SP change address.
+    pub is_change: bool,
+}
+
+/// A transaction the user confirms before it is signed.
+///
+/// `psbt` is the unsigned PSBTv2 to hand to
+/// [`crate::api::sp_signer::sign_silent_payment_psbt`]; every other field is
+/// read from it, for display. [`crate::api::sp_account::SpAccount::finalize`]
+/// takes the simulation back with the signed PSBT and refuses one whose
+/// transaction differs from it.
 #[frb(unignore)]
 #[derive(Debug, Clone)]
 pub struct TxSimulation {
+    /// The coins spent, in transaction order.
     pub inputs: Vec<UnifiedCoinView>,
+    /// The requested recipients, a max amount resolved to what it pays.
     pub outputs: Vec<RecipientView>,
+    /// Every output of the transaction, change included.
+    pub tx_outputs: Vec<SimulatedOutput>,
     pub fee_sat: u64,
     pub change_sat: u64,
+    /// The fee rate the transaction was built at, in sat/vB.
+    pub fee_rate_sat_vb: u64,
+    /// The unsigned PSBTv2.
+    pub psbt: Vec<u8>,
 }
 
 #[frb(unignore)]
@@ -236,6 +282,16 @@ pub enum SpError {
     /// key owns, an unsupported input, a PSBT already signed, a malformed key.
     /// Nothing was signed. `reason` carries no key material.
     Signing { reason: String },
+    /// The signed PSBT handed to `finalize` does not spend and pay exactly
+    /// what the simulation the user confirmed does (inputs, outputs, amounts,
+    /// fee), or the simulation no longer matches its own PSBT. Nothing was
+    /// finalized. `detail` is for logs.
+    SignedPsbtMismatch { detail: String },
+    /// The account's own check of the signed PSBT failed: a BIP375 share,
+    /// proof or silent-payment output script does not verify, or the
+    /// signatures do not finalize. The signer malfunctioned or lied about a
+    /// destination. Nothing was finalized. `reason` is for logs.
+    Verification { reason: String },
     /// Anything else. `message` is for logs, never for the user.
     Other { message: String },
 }
@@ -264,6 +320,13 @@ impl std::fmt::Display for SpError {
             ),
             Self::InvalidDescriptor { reason } => write!(f, "invalid descriptor: {reason}"),
             Self::Signing { reason } => write!(f, "signing refused: {reason}"),
+            Self::SignedPsbtMismatch { detail } => {
+                write!(
+                    f,
+                    "signed PSBT does not match the confirmed transaction: {detail}"
+                )
+            }
+            Self::Verification { reason } => write!(f, "signed PSBT failed verification: {reason}"),
             Self::Other { message } => write!(f, "{message}"),
         }
     }
